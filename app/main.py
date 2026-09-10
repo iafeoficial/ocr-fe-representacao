@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 import logging
+import time
+from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
@@ -8,16 +11,19 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .auth import require_ocr_secret
-from .catalog import fetch_codigos_for_industria
 from .config import get_settings
-from .match import match_candidatos, pick_sugerido
-from .ocr import extract_price, run_ocr_best
-from .preprocess import preprocess_for_ocr
+from .ocr import (
+    assign_varejo_atacado,
+    clean_product_name,
+    extract_all_prices,
+    run_ocr_best,
+)
+from .preprocess import prepare_tag_and_full
 
 logger = logging.getLogger("pesquisa_ocr")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Pesquisa OCR", version="1.0.0")
+app = FastAPI(title="Pesquisa OCR", version="1.1.0")
 
 _settings = get_settings()
 app.add_middleware(
@@ -29,6 +35,27 @@ app.add_middleware(
 )
 
 TipoPesquisa = Literal["interna", "externa"]
+
+_DEBUG_LOG = Path(__file__).resolve().parents[2] / "debug-bdee85.log"
+
+
+def _agent_log(hypothesis_id: str, message: str, data: dict[str, Any]) -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "bdee85",
+            "runId": "ocr-post",
+            "hypothesisId": hypothesis_id,
+            "location": "pesquisa-ocr/main.py",
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with _DEBUG_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    # #endregion
 
 
 @app.get("/health")
@@ -52,55 +79,81 @@ async def ocr_pesquisa(
 
     produto_bytes = await produto_crop.read()
     preco_bytes = await preco_crop.read()
-    if not produto_bytes or not preco_bytes:
+    raw = produto_bytes if len(produto_bytes) >= len(preco_bytes) else preco_bytes
+    if not raw:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="produto_crop e preco_crop são obrigatórios",
         )
 
     try:
-        produto_img = preprocess_for_ocr(produto_bytes)
-        preco_img = preprocess_for_ocr(preco_bytes)
-        texto_ocr = run_ocr_best(produto_img)
-        preco_ocr_raw = run_ocr_best(preco_img, psms=(7, 8, 6))
-        preco = extract_price(preco_ocr_raw) or extract_price(texto_ocr)
+        full_gray, tag_gray, tag_price_gray = prepare_tag_and_full(raw)
+
+        tag_text = ""
+        if tag_gray is not None:
+            tag_text = run_ocr_best(tag_gray, psms=(6, 4, 11, 3))
+
+        full_text = run_ocr_best(full_gray, psms=(6, 4, 11))
+
+        price_text = ""
+        if tag_price_gray is not None:
+            price_text = run_ocr_best(
+                tag_price_gray,
+                psms=(7, 6, 11),
+                whitelist="0123456789R$rs., ",
+            )
+        if not price_text and tag_gray is not None:
+            price_text = run_ocr_best(tag_gray, psms=(7, 6, 11))
+        if not price_text:
+            price_text = full_text
+
+        source_for_name = tag_text if len(tag_text) >= 8 else full_text
+        descricao = clean_product_name(source_for_name) or clean_product_name(full_text)
+
+        prices = (
+            extract_all_prices(price_text)
+            or extract_all_prices(tag_text)
+            or extract_all_prices(full_text)
+        )
+        preco_varejo, preco_atacado = assign_varejo_atacado(prices)
+        preco = preco_varejo
+
+        _agent_log(
+            "A-B-C",
+            "ocr_pesquisa result",
+            {
+                "usedYellowTag": tag_gray is not None,
+                "tagTextSample": tag_text[:160],
+                "fullTextSample": full_text[:120],
+                "priceTextSample": price_text[:120],
+                "prices": prices,
+                "preco_varejo": preco_varejo,
+                "preco_atacado": preco_atacado,
+                "descricao": (descricao or "")[:120],
+            },
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=str(exc),
         ) from exc
-    except Exception as exc:  # noqa: BLE001 — surface OCR runtime errors
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Falha no OCR")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Falha no OCR: {exc}",
         ) from exc
 
-    candidatos: list[dict[str, Any]] = []
-    if tipo_norm == "interna":
-        settings = get_settings()
-        try:
-            catalogo = await fetch_codigos_for_industria(settings, industria)
-            candidatos = match_candidatos(texto_ocr, catalogo, top_n=3)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("Falha ao buscar codigos")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"Falha ao consultar catálogo: {exc}",
-            ) from exc
-
-    sugerido = pick_sugerido(candidatos)
-    # Never replace raw OCR with a weak catalog hit.
-    descricao = sugerido["produto"] if sugerido else texto_ocr
-
     body = {
         "tipo": tipo_norm,
         "industria": industria.strip(),
-        "texto_ocr": texto_ocr,
-        "preco_ocr_raw": preco_ocr_raw,
+        "texto_ocr": descricao or tag_text or full_text,
+        "preco_ocr_raw": price_text,
         "preco": preco,
+        "preco_varejo": preco_varejo,
+        "preco_atacado": preco_atacado,
         "descricao": descricao,
-        "sugerido": sugerido,
-        "candidatos": candidatos,
+        "sugerido": None,
+        "candidatos": [],
     }
     return JSONResponse(body)
