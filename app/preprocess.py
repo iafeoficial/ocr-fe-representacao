@@ -14,11 +14,25 @@ def decode_image(data: bytes) -> np.ndarray:
     return img
 
 
+def _crop_padded(
+    bgr: np.ndarray, x: int, y: int, bw: int, bh: int, *, pad_frac: float = 0.06
+) -> np.ndarray | None:
+    h, w = bgr.shape[:2]
+    pad = max(8, int(min(bw, bh) * pad_frac))
+    x0, y0 = max(0, x - pad), max(0, y - pad)
+    x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
+    crop = bgr[y0:y1, x0:x1]
+    if crop.size == 0:
+        return None
+    return crop
+
+
 def find_yellow_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
-    """Recorta a maior região amarela (etiqueta de preço Mateus/gondola)."""
+    """Recorta região amarela de etiqueta (ignora emballage grande tipo sachê verde)."""
     if bgr is None or bgr.size == 0:
         return None
     h, w = bgr.shape[:2]
+    img_area = float(h * w)
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (15, 70, 70), (42, 255, 255))
     mask = cv2.morphologyEx(
@@ -30,18 +44,81 @@ def find_yellow_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
-    cnt = max(cnts, key=cv2.contourArea)
-    area = float(cv2.contourArea(cnt))
-    if area < (h * w) * 0.01:
+    # Prefer smaller yellow rectangles (real price tags), not product packaging.
+    candidates: list[tuple[float, int, int, int, int]] = []
+    for cnt in cnts:
+        area = float(cv2.contourArea(cnt))
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        box_area = float(bw * bh)
+        # Contour can be sparse; also reject huge bounding boxes (green sachets).
+        if area < img_area * 0.008 or box_area > img_area * 0.28:
+            continue
+        if bw < 40 or bh < 24:
+            continue
+        aspect = bw / max(bh, 1)
+        if aspect < 1.2 or aspect > 8.0:
+            continue
+        # Prefer lower half (shelf edge).
+        y_bias = 1.0 + (y + bh / 2) / h
+        candidates.append((area * y_bias, x, y, bw, bh))
+    if not candidates:
         return None
-    x, y, bw, bh = cv2.boundingRect(cnt)
-    pad = max(8, int(min(bw, bh) * 0.06))
-    x0, y0 = max(0, x - pad), max(0, y - pad)
-    x1, y1 = min(w, x + bw + pad), min(h, y + bh + pad)
-    crop = bgr[y0:y1, x0:x1]
-    if crop.size == 0:
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    _, x, y, bw, bh = candidates[0]
+    return _crop_padded(bgr, x, y, bw, bh)
+
+
+def find_white_shelf_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
+    """Recorta etiqueta branca Mateus (ATACADO|VAREJO) na borda da gôndola."""
+    if bgr is None or bgr.size == 0:
         return None
-    return crop
+    h, w = bgr.shape[:2]
+    img_area = float(h * w)
+    # Focus search on lower 55% (shelf strip); full frame still allowed if needed.
+    y0_search = int(h * 0.40)
+    roi = bgr[y0_search:, :]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    # Low saturation + high value ≈ white label paper.
+    mask = cv2.inRange(hsv, (0, 0, 155), (180, 55, 255))
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (15, 9)),
+        iterations=2,
+    )
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    scored: list[tuple[float, int, int, int, int]] = []
+    for cnt in cnts:
+        area = float(cv2.contourArea(cnt))
+        if area < img_area * 0.012 or area > img_area * 0.35:
+            continue
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        if bw < 80 or bh < 36:
+            continue
+        aspect = bw / max(bh, 1)
+        if aspect < 1.6 or aspect > 7.5:
+            continue
+        # Wider + mid-lower = typical Mateus shelf label.
+        score = area * (1.0 + aspect / 4.0) * (1.0 + (y0_search + y) / h)
+        scored.append((score, x, y0_search + y, bw, bh))
+    if not scored:
+        return None
+    scored.sort(key=lambda t: t[0], reverse=True)
+    _, x, y, bw, bh = scored[0]
+    return _crop_padded(bgr, x, y, bw, bh, pad_frac=0.04)
+
+
+def find_price_tag_bgr(bgr: np.ndarray) -> tuple[np.ndarray | None, str]:
+    """Prefere etiqueta branca Mateus; fallback amarela pequena."""
+    white = find_white_shelf_tag_bgr(bgr)
+    if white is not None:
+        return white, "white"
+    yellow = find_yellow_tag_bgr(bgr)
+    if yellow is not None:
+        return yellow, "yellow"
+    return None, "none"
 
 
 def to_ocr_gray(bgr: np.ndarray, *, min_scale: float = 2.0) -> np.ndarray:
@@ -93,11 +170,29 @@ def preprocess_for_ocr(data: bytes, *, min_scale: float = 2.0) -> np.ndarray:
 
 def prepare_tag_and_full(
     data: bytes,
-) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
-    """Retorna (gray_full, gray_tag_or_None, gray_tag_price_or_None)."""
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, str]:
+    """Retorna (gray_full, gray_tag, gray_tag_price, tag_bgr_or_None, tag_kind)."""
     bgr = decode_image(data)
     full = to_ocr_gray(bgr)
-    tag_bgr = find_yellow_tag_bgr(bgr)
+    tag_bgr, kind = find_price_tag_bgr(bgr)
     if tag_bgr is None:
-        return full, None, None
-    return full, to_ocr_gray(tag_bgr, min_scale=2.5), to_price_ocr_gray(tag_bgr)
+        return full, None, None, None, kind
+    return (
+        full,
+        to_ocr_gray(tag_bgr, min_scale=2.5),
+        to_price_ocr_gray(tag_bgr),
+        tag_bgr,
+        kind,
+    )
+
+
+def split_tag_price_halves(
+    tag_bgr: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Mateus: esquerda=ATACADO, direita=VAREJO."""
+    h, w = tag_bgr.shape[:2]
+    # Drop top ~28% (product name strip) so digits dominate.
+    y0 = int(h * 0.28)
+    body = tag_bgr[y0:, :]
+    mid = body.shape[1] // 2
+    return body[:, :mid], body[:, mid:]

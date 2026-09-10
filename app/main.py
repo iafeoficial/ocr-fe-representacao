@@ -16,14 +16,15 @@ from .ocr import (
     assign_varejo_atacado,
     clean_product_name,
     extract_all_prices,
+    pick_unit_price,
     run_ocr_best,
 )
-from .preprocess import prepare_tag_and_full
+from .preprocess import prepare_tag_and_full, split_tag_price_halves, to_price_ocr_gray
 
 logger = logging.getLogger("pesquisa_ocr")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Pesquisa OCR", version="1.1.0")
+app = FastAPI(title="Pesquisa OCR", version="1.2.0")
 
 _settings = get_settings()
 app.add_middleware(
@@ -86,8 +87,10 @@ async def ocr_pesquisa(
             detail="produto_crop e preco_crop são obrigatórios",
         )
 
+    industria_s = industria.strip()
+
     try:
-        full_gray, tag_gray, tag_price_gray = prepare_tag_and_full(raw)
+        full_gray, tag_gray, tag_price_gray, tag_bgr, tag_kind = prepare_tag_and_full(raw)
 
         tag_text = ""
         if tag_gray is not None:
@@ -107,26 +110,57 @@ async def ocr_pesquisa(
         if not price_text:
             price_text = full_text
 
+        # Mateus spatial: left half = atacado, right half = varejo.
+        spatial_atacado: str | None = None
+        spatial_varejo: str | None = None
+        if tag_bgr is not None:
+            left_bgr, right_bgr = split_tag_price_halves(tag_bgr)
+            left_txt = run_ocr_best(
+                to_price_ocr_gray(left_bgr),
+                psms=(7, 6, 11),
+                whitelist="0123456789R$rs., ",
+            )
+            right_txt = run_ocr_best(
+                to_price_ocr_gray(right_bgr),
+                psms=(7, 6, 11),
+                whitelist="0123456789R$rs., ",
+            )
+            spatial_atacado = pick_unit_price(left_txt, prefer="min")
+            spatial_varejo = pick_unit_price(right_txt, prefer="first")
+
         source_for_name = tag_text if len(tag_text) >= 8 else full_text
-        descricao = clean_product_name(source_for_name) or clean_product_name(full_text)
+        descricao = clean_product_name(
+            source_for_name, brand_hint=industria_s
+        ) or clean_product_name(full_text, brand_hint=industria_s)
 
         prices = (
             extract_all_prices(price_text)
             or extract_all_prices(tag_text)
             or extract_all_prices(full_text)
         )
-        preco_varejo, preco_atacado = assign_varejo_atacado(prices)
-        preco = preco_varejo
+
+        if spatial_atacado or spatial_varejo:
+            preco_atacado = spatial_atacado
+            preco_varejo = spatial_varejo
+            if preco_varejo and preco_atacado and preco_varejo == preco_atacado:
+                preco_varejo = None
+        else:
+            preco_varejo, preco_atacado = assign_varejo_atacado(prices)
+
+        preco = preco_varejo or preco_atacado
 
         _agent_log(
-            "A-B-C",
+            "A-B-F-G",
             "ocr_pesquisa result",
             {
-                "usedYellowTag": tag_gray is not None,
+                "tagKind": tag_kind,
+                "usedTag": tag_gray is not None,
                 "tagTextSample": tag_text[:160],
                 "fullTextSample": full_text[:120],
                 "priceTextSample": price_text[:120],
                 "prices": prices,
+                "spatialAtacado": spatial_atacado,
+                "spatialVarejo": spatial_varejo,
                 "preco_varejo": preco_varejo,
                 "preco_atacado": preco_atacado,
                 "descricao": (descricao or "")[:120],
@@ -146,7 +180,7 @@ async def ocr_pesquisa(
 
     body = {
         "tipo": tipo_norm,
-        "industria": industria.strip(),
+        "industria": industria_s,
         "texto_ocr": descricao or tag_text or full_text,
         "preco_ocr_raw": price_text,
         "preco": preco,
