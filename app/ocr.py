@@ -12,6 +12,17 @@ PRODUCT_LINE_RE = re.compile(
     r"\b([A-ZÁÉÍÓÚÂÊÔÃÕÇ][A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9][A-ZÁÉÍÓÚÂÊÔÃÕÇ0-9\s/\-]{6,}?(?:\s+\d{2,4}\s*G)?)\b"
 )
 WEIGHT_RE = re.compile(r"\b(\d{2,4})\s*G\b", re.I)
+# Mateus dual-column: ATACADO | VAREJO side-by-side.
+MATEUS_DUAL_RE = re.compile(r"\bATACADO\b.*\bVAREJO\b|\bVAREJO\b.*\bATACADO\b", re.I)
+# Unit + embalagem pack (centered unit price; EMB line at bottom).
+UNIT_EMB_HINT_RE = re.compile(
+    r"POR\s+UNIDADE|PRECO\s+POR|EMB\.?\s*C/?\s*\d+", re.I
+)
+# EMB. C/ 32 UND. R$ 89,28  (OCR may drop dots/spaces)
+EMB_PACK_RE = re.compile(
+    r"EMB\.?\s*C/?\s*(\d{1,3})\s*U(?:ND)?\.?\s*(?:R\s*\$|R\$|RS)?\s*(\d{1,3}[.,]\d{2})",
+    re.I,
+)
 
 
 def run_ocr(image: np.ndarray, *, psm: int = 6, whitelist: str | None = None) -> str:
@@ -140,6 +151,77 @@ def reconcile_spatial_prices(
     if _price_to_float(varejo) > _price_to_float(atacado) * 1.5:
         return atacado, varejo
     return varejo, atacado
+
+
+def _norm_price(raw: str) -> str:
+    return raw if "," in raw else raw.replace(".", ",")
+
+
+def _format_brl(value: float) -> str:
+    return f"{value:.2f}".replace(".", ",")
+
+
+def is_mateus_dual_column(text: str) -> bool:
+    """True when etiqueta has ATACADO and VAREJO labels (L/R split OK)."""
+    return bool(MATEUS_DUAL_RE.search(text or ""))
+
+
+def is_unit_emb_layout(text: str) -> bool:
+    """True for PRECO POR UNIDADE + EMB pack tags (centered unit, not L/R)."""
+    return bool(UNIT_EMB_HINT_RE.search(text or ""))
+
+
+def extract_emb_pack(text: str) -> tuple[int, str] | None:
+    """Parse EMB. C/ N UND. R$ X,YY → (N, pack_price)."""
+    m = EMB_PACK_RE.search(text or "")
+    if not m:
+        return None
+    units = int(m.group(1))
+    if units < 2 or units > 96:
+        return None
+    return units, _norm_price(m.group(2))
+
+
+def merge_price_lists(*sources: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for src in sources:
+        for p in extract_all_prices(src):
+            if p in seen:
+                continue
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def assign_prices_from_labels(
+    *texts: str,
+) -> tuple[str | None, str | None, str]:
+    """Prefer EMB/unit labels over Mateus L/R halves.
+
+    Returns (varejo, atacado, strategy).
+    """
+    blob = " ".join(t for t in texts if t)
+    if not blob.strip():
+        return None, None, "empty"
+
+    emb = extract_emb_pack(blob)
+    if emb is not None:
+        units, pack = emb
+        derived = _price_to_float(pack) / float(units)
+        varejo = _format_brl(derived)
+        # Prefer an OCR'd unit price that matches pack/N (fixes 2,19 vs 2,79).
+        for p in merge_price_lists(blob):
+            if abs(_price_to_float(p) - derived) <= 0.06:
+                varejo = p
+                break
+        return varejo, pack, "emb-pack"
+
+    if is_unit_emb_layout(blob):
+        v, a = assign_varejo_atacado(merge_price_lists(blob))
+        return v, a, "unit-emb-prices"
+
+    return None, None, "none"
 
 _PRODUCT_NOUNS = (
     "ERVILHA",

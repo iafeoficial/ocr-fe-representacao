@@ -13,9 +13,12 @@ from fastapi.responses import JSONResponse
 from .auth import require_ocr_secret
 from .config import get_settings
 from .ocr import (
+    assign_prices_from_labels,
     assign_varejo_atacado,
     clean_product_name,
-    extract_all_prices,
+    is_mateus_dual_column,
+    is_unit_emb_layout,
+    merge_price_lists,
     pick_unit_price,
     reconcile_spatial_prices,
     run_ocr_best,
@@ -25,8 +28,8 @@ from .preprocess import prepare_tag_and_full, split_tag_price_halves, to_price_o
 logger = logging.getLogger("pesquisa_ocr")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Pesquisa OCR", version="1.2.2")
-OCR_BUILD = "1.2.2-shelf-trim"
+app = FastAPI(title="Pesquisa OCR", version="1.2.3")
+OCR_BUILD = "1.2.3-unit-emb"
 
 _settings = get_settings()
 app.add_middleware(
@@ -112,37 +115,47 @@ async def ocr_pesquisa(
         if not price_text:
             price_text = full_text
 
-        # Mateus spatial: left half = atacado, right half = varejo.
+        # Mateus L/R only when ATACADO+VAREJO labels exist.
+        # PRECO POR UNIDADE + EMB tags have centered unit price — L/R bisects "2,79".
         spatial_atacado: str | None = None
         spatial_varejo: str | None = None
-        if tag_bgr is not None:
+        spatial_left_txt = ""
+        spatial_right_txt = ""
+        use_spatial = (
+            tag_bgr is not None
+            and is_mateus_dual_column(tag_text)
+            and not is_unit_emb_layout(tag_text)
+        )
+        if use_spatial and tag_bgr is not None:
             left_bgr, right_bgr = split_tag_price_halves(tag_bgr)
-            left_txt = run_ocr_best(
+            spatial_left_txt = run_ocr_best(
                 to_price_ocr_gray(left_bgr),
                 psms=(7, 6, 11),
                 whitelist="0123456789R$rs., ",
             )
-            right_txt = run_ocr_best(
+            spatial_right_txt = run_ocr_best(
                 to_price_ocr_gray(right_bgr),
                 psms=(7, 6, 11),
                 whitelist="0123456789R$rs., ",
             )
             # Esquerda: EMB pack (maior). Direita: unitário varejo.
-            spatial_atacado = pick_unit_price(left_txt, prefer="max")
-            spatial_varejo = pick_unit_price(right_txt, prefer="first")
+            spatial_atacado = pick_unit_price(spatial_left_txt, prefer="max")
+            spatial_varejo = pick_unit_price(spatial_right_txt, prefer="first")
 
         source_for_name = tag_text if len(tag_text) >= 8 else full_text
         descricao = clean_product_name(
             source_for_name, brand_hint=industria_s
         ) or clean_product_name(full_text, brand_hint=industria_s)
 
-        prices = (
-            extract_all_prices(price_text)
-            or extract_all_prices(tag_text)
-            or extract_all_prices(full_text)
+        prices = merge_price_lists(price_text, tag_text, full_text)
+        label_varejo, label_atacado, price_strategy = assign_prices_from_labels(
+            tag_text, price_text, full_text
         )
 
-        if spatial_atacado or spatial_varejo:
+        if label_varejo or label_atacado:
+            preco_varejo, preco_atacado = label_varejo, label_atacado
+            price_strategy = f"label:{price_strategy}"
+        elif use_spatial and (spatial_atacado or spatial_varejo):
             preco_atacado = spatial_atacado
             preco_varejo = spatial_varejo
             preco_varejo, preco_atacado = reconcile_spatial_prices(
@@ -150,22 +163,28 @@ async def ocr_pesquisa(
             )
             if preco_varejo and preco_atacado and preco_varejo == preco_atacado:
                 preco_varejo = None
+            price_strategy = "spatial-mateus"
         else:
             preco_varejo, preco_atacado = assign_varejo_atacado(prices)
+            price_strategy = "assign-fallback"
 
         preco = preco_varejo or preco_atacado
 
         _agent_log(
-            "H2-H3-H6",
+            "H-C",
             "ocr_pesquisa result",
             {
                 "build": OCR_BUILD,
                 "tagKind": tag_kind,
                 "usedTag": tag_gray is not None,
                 "tagShape": list(tag_bgr.shape[:2]) if tag_bgr is not None else None,
+                "useSpatial": use_spatial,
+                "priceStrategy": price_strategy,
                 "tagTextSample": tag_text[:160],
                 "fullTextSample": full_text[:120],
                 "priceTextSample": price_text[:120],
+                "spatialLeftSample": spatial_left_txt[:80],
+                "spatialRightSample": spatial_right_txt[:80],
                 "prices": prices,
                 "spatialAtacado": spatial_atacado,
                 "spatialVarejo": spatial_varejo,
