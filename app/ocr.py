@@ -94,7 +94,42 @@ def clean_product_name(text: str) -> str:
     upper = re.sub(r"[|_[\]{}<>]+", " ", upper)
     upper = re.sub(r"\s+", " ", upper).strip()
 
+    brands = (
+        "PREDILECTA",
+        "STELLA",
+        "HARIBO",
+        "NESTLE",
+        "BAUDI",
+        "HEINZ",
+        "QUERO",
+        "ELEFANTE",
+    )
     scored: list[tuple[int, str]] = []
+
+    for brand in brands:
+        idx = upper.find(brand)
+        if idx < 0:
+            continue
+        left = upper[:idx].rfind("  ")
+        start = 0 if left < 0 else left + 2
+        # walk left to include previous words (max ~50 chars)
+        start = max(0, idx - 50)
+        chunk = upper[start : idx + len(brand) + 30]
+        # trim to letters/digits around brand
+        m = re.search(
+            rf"([A-Z0-9][A-Z0-9\s/\-]{{0,40}}{re.escape(brand)}[A-Z0-9\s/\-]{{0,20}}(?:\d{{2,4}}\s*G)?)",
+            chunk,
+        )
+        if not m:
+            continue
+        phrase = re.sub(r"\s+", " ", m.group(1)).strip(" -/")
+        if any(j in phrase for j in ("ANALISANDO", "PROCESSANDO", "SEGURA", "CELULAR")):
+            continue
+        score = len(phrase) + 50
+        if WEIGHT_RE.search(phrase):
+            score += 20
+        scored.append((score, phrase))
+
     for m in PRODUCT_LINE_RE.finditer(upper):
         phrase = re.sub(r"\s+", " ", m.group(1)).strip(" -/")
         if any(
@@ -112,7 +147,7 @@ def clean_product_name(text: str) -> str:
         if len(phrase) < 8:
             continue
         score = len(phrase)
-        if any(b in phrase for b in ("PREDILECTA", "STELLA", "HARIBO", "NESTLE", "BAUDI")):
+        if any(b in phrase for b in brands):
             score += 40
         if WEIGHT_RE.search(phrase):
             score += 20
