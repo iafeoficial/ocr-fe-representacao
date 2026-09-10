@@ -29,6 +29,7 @@ Resposta JSON (resumo): `texto_ocr`, `preco`, `descricao`, `sugerido`, `candidat
 | `OCR_SHARED_SECRET` | sim | Valor do header `X-OCR-Secret` (igual a `VITE_PESQUISA_OCR_SECRET` no front) |
 | `SUPABASE_URL` | sim* | URL do projeto Supabase (`https://….supabase.co`) |
 | `SUPABASE_SERVICE_ROLE_KEY` | sim* | Service role — **somente leitura** de `public.codigos` |
+| `CORS_ORIGINS` | não | Default `*` (browser Vite/prod). Alternativa: lista CSV de origins |
 | `HOST` | não | Default `0.0.0.0` |
 | `PORT` | não | Default `8000` (Coolify mapeia a porta do container) |
 

@@ -4,6 +4,7 @@ import logging
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .auth import require_ocr_secret
@@ -17,6 +18,15 @@ logger = logging.getLogger("pesquisa_ocr")
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="Pesquisa OCR", version="1.0.0")
+
+_settings = get_settings()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_settings.parsed_cors_origins(),
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*", "X-OCR-Secret"],
+)
 
 TipoPesquisa = Literal["interna", "externa"]
 
