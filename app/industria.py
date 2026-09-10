@@ -27,14 +27,17 @@ def to_industria_padrao(nome: str) -> str:
 
 
 def industrias_match(a: str, b: str) -> bool:
+    """Match estrito: igualdade, contenção (>=5), ou mesmo primeiro token (>=5)."""
     na = normalize_industria_key(a)
     nb = normalize_industria_key(b)
     if not na or not nb:
         return False
     if na == nb:
         return True
-    if na in nb or nb in na:
+    # Contenção só se o menor tiver pelo menos 5 chars (evita "SA" / ruído curto).
+    shorter, longer = (na, nb) if len(na) <= len(nb) else (nb, na)
+    if len(shorter) >= 5 and shorter in longer:
         return True
     token_a = na.split(" ")[0] if na else ""
     token_b = nb.split(" ")[0] if nb else ""
-    return len(token_a) >= 4 and token_a == token_b
+    return len(token_a) >= 5 and token_a == token_b

@@ -10,8 +10,8 @@ from fastapi.responses import JSONResponse
 from .auth import require_ocr_secret
 from .catalog import fetch_codigos_for_industria
 from .config import get_settings
-from .match import match_candidatos
-from .ocr import extract_price, run_ocr
+from .match import match_candidatos, pick_sugerido
+from .ocr import extract_price, run_ocr_best
 from .preprocess import preprocess_for_ocr
 
 logger = logging.getLogger("pesquisa_ocr")
@@ -61,8 +61,8 @@ async def ocr_pesquisa(
     try:
         produto_img = preprocess_for_ocr(produto_bytes)
         preco_img = preprocess_for_ocr(preco_bytes)
-        texto_ocr = run_ocr(produto_img, psm=6)
-        preco_ocr_raw = run_ocr(preco_img, psm=7)
+        texto_ocr = run_ocr_best(produto_img)
+        preco_ocr_raw = run_ocr_best(preco_img, psms=(7, 8, 6))
         preco = extract_price(preco_ocr_raw) or extract_price(texto_ocr)
     except ValueError as exc:
         raise HTTPException(
@@ -89,12 +89,9 @@ async def ocr_pesquisa(
                 detail=f"Falha ao consultar catálogo: {exc}",
             ) from exc
 
-    sugerido = candidatos[0] if candidatos else None
-    descricao = (
-        sugerido["produto"]
-        if sugerido
-        else texto_ocr
-    )
+    sugerido = pick_sugerido(candidatos)
+    # Never replace raw OCR with a weak catalog hit.
+    descricao = sugerido["produto"] if sugerido else texto_ocr
 
     body = {
         "tipo": tipo_norm,

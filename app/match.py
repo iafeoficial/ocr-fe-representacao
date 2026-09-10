@@ -6,13 +6,18 @@ from typing import Any
 
 from rapidfuzz import fuzz, process
 
+# Include in candidate list (user can still pick manually).
+MIN_CANDIDATE_SCORE = 50.0
+# Only auto-fill descricao / sugerido at or above this.
+AUTO_SUGGEST_MIN_SCORE = 75.0
+
 
 def match_candidatos(
     texto_ocr: str,
     catalogo: list[dict[str, Any]],
     *,
     top_n: int = 3,
-    min_score: float = 40.0,
+    min_score: float = MIN_CANDIDATE_SCORE,
 ) -> list[dict[str, Any]]:
     query = (texto_ocr or "").strip()
     if not query or not catalogo:
@@ -40,3 +45,18 @@ def match_candidatos(
             }
         )
     return out
+
+
+def pick_sugerido(
+    candidatos: list[dict[str, Any]],
+    *,
+    min_score: float = AUTO_SUGGEST_MIN_SCORE,
+) -> dict[str, Any] | None:
+    """Top candidate only if score is strong enough to auto-apply."""
+    if not candidatos:
+        return None
+    top = candidatos[0]
+    score = top.get("score")
+    if not isinstance(score, (int, float)) or float(score) < min_score:
+        return None
+    return top
