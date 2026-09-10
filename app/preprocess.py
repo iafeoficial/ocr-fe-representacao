@@ -68,41 +68,66 @@ def find_yellow_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
     return _crop_padded(bgr, x, y, bw, bh)
 
 
-def _trim_white_paper_vs_blue_rail(
-    bgr: np.ndarray, x: int, y: int, bw: int, bh: int
-) -> tuple[int, int, int, int]:
-    """Aperta bbox horizontal: papel branco vs trilho azul (quebra chrome full-bleed)."""
-    h, w = bgr.shape[:2]
-    x0, y0 = max(0, x), max(0, y)
-    x1, y1 = min(w, x + bw), min(h, y + bh)
-    if x1 - x0 < 40 or y1 - y0 < 24:
-        return x, y, bw, bh
-    sub = bgr[y0:y1, x0:x1]
-    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, (0, 0, 155), (180, 55, 255))
-    blue = cv2.inRange(hsv, (95, 70, 40), (130, 255, 255))
-    col_w = white.mean(axis=0)
-    col_b = blue.mean(axis=0)
-    # Colunas com papel branco dominante e pouco azul.
-    dom = (col_w > 70) & (col_b < 50)
+def _longest_true_run(flags: np.ndarray) -> tuple[int, int] | None:
     best: tuple[int, int] | None = None
     i = 0
-    sw = sub.shape[1]
-    while i < sw:
-        if not dom[i]:
+    n = int(flags.shape[0])
+    while i < n:
+        if not flags[i]:
             i += 1
             continue
         j = i
-        while j < sw and dom[j]:
+        while j < n and flags[j]:
             j += 1
         if best is None or (j - i) > (best[1] - best[0]):
             best = (i, j)
         i = j
-    if best is None or (best[1] - best[0]) < max(80, int(bw * 0.25)):
+    return best
+
+
+def _trim_white_paper_vs_blue_rail(
+    bgr: np.ndarray, x: int, y: int, bw: int, bh: int
+) -> tuple[int, int, int, int]:
+    """Aperta bbox H+V: papel branco vs trilho azul (isola etiqueta no strip full-bleed)."""
+    h, w = bgr.shape[:2]
+    base_x, base_y = max(0, x), max(0, y)
+    x0, y0 = base_x, base_y
+    x1, y1 = min(w, x + bw), min(h, y + bh)
+    if x1 - x0 < 40 or y1 - y0 < 24:
         return x, y, bw, bh
-    nx0 = x0 + best[0]
-    nx1 = x0 + best[1]
-    return nx0, y0, nx1 - nx0, y1 - y0
+
+    sub = bgr[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, (0, 0, 155), (180, 55, 255))
+    blue = cv2.inRange(hsv, (95, 70, 40), (130, 255, 255))
+
+    # Horizontal: longest white-dominant column run.
+    # Do NOT use bw*0.25 — on full-width shelf strips a real ~396px tag
+    # fails when the threshold becomes ~399.
+    col_dom = (white.mean(axis=0) > 70) & (blue.mean(axis=0) < 50)
+    best_c = _longest_true_run(col_dom)
+    min_run_c = max(80, int(min(bw, w) * 0.10))
+    if best_c is not None and (best_c[1] - best_c[0]) >= min_run_c:
+        x0 = base_x + best_c[0]
+        x1 = base_x + best_c[1]
+
+    sub = bgr[y0:y1, x0:x1]
+    if sub.size == 0:
+        return x, y, bw, bh
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, (0, 0, 155), (180, 55, 255))
+    blue = cv2.inRange(hsv, (95, 70, 40), (130, 255, 255))
+    row_dom = (white.mean(axis=1) > 55) & (blue.mean(axis=1) < 60)
+    best_r = _longest_true_run(row_dom)
+    min_run_r = max(28, int((y1 - y0) * 0.12))
+    if best_r is not None and (best_r[1] - best_r[0]) >= min_run_r:
+        y0 = base_y + best_r[0]
+        y1 = base_y + best_r[1]
+
+    nw, nh = x1 - x0, y1 - y0
+    if nw < 40 or nh < 24:
+        return x, y, bw, bh
+    return x0, y0, nw, nh
 
 
 def find_white_shelf_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
@@ -140,8 +165,8 @@ def find_white_shelf_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
         if bw < 80 or bh < 36:
             continue
         aspect = bw / max(bh, 1)
-        # Mateus labels ~1.4–4; reject near full-frame chrome blobs.
-        if aspect < 1.35 or aspect > 6.5:
+        # Mateus labels ~1.3–4; reject near full-frame chrome blobs.
+        if aspect < 1.30 or aspect > 6.5:
             continue
         width_frac = bw / max(w, 1)
         touches_both = abs_x <= 4 and (abs_x + bw) >= (w - 4)
@@ -153,11 +178,13 @@ def find_white_shelf_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
             abs_x, abs_y, bw, bh = tx, ty, tw, th
             aspect = bw / max(bh, 1)
             area = float(bw * bh)
-            if aspect < 1.35 or bw < 80:
+            if aspect < 1.30 or bw < 80 or bh < 36:
                 continue
-        # Prefer inset shelf labels over edge-to-edge chrome.
+        # Prefer inset shelf-edge labels; demote mid-frame packaging whites.
         inset = 1.35 if (abs_x > 8 and abs_x + bw < w - 8) else 0.55
-        score = area * (1.0 + aspect / 4.0) * (1.0 + abs_y / h) * inset
+        cy = (abs_y + bh / 2) / max(h, 1)
+        shelf_bias = 0.45 if cy < 0.55 else (1.0 + cy)
+        score = area * (1.0 + aspect / 4.0) * (1.0 + abs_y / h) * inset * shelf_bias
         scored.append((score, abs_x, abs_y, bw, bh))
     if not scored:
         return None

@@ -44,19 +44,29 @@ def extract_price(text: str) -> str | None:
     return prices[0] if prices else None
 
 
+def _price_to_float(p: str) -> float:
+    return float(p.replace(".", "").replace(",", "."))
+
+
 def pick_unit_price(text: str, *, prefer: str = "first") -> str | None:
-    """Escolhe preço de unidade; ignora emb. packs altos na mesma metade."""
+    """Escolhe preço na metade da etiqueta.
+
+    prefer:
+      - first: primeiro preço unitário (<80)
+      - min: menor unitário
+      - max: maior (emb. pack / atacado Mateus na coluna esquerda)
+    """
     prices = extract_all_prices(text)
     if not prices:
         return None
 
-    def to_float(p: str) -> float:
-        return float(p.replace(".", "").replace(",", "."))
+    if prefer == "max":
+        return max(prices, key=_price_to_float)
 
-    unitish = [p for p in prices if 0.5 <= to_float(p) < 80.0]
+    unitish = [p for p in prices if 0.5 <= _price_to_float(p) < 80.0]
     pool = unitish or prices
     if prefer == "min":
-        return min(pool, key=to_float)
+        return min(pool, key=_price_to_float)
     return pool[0]
 
 
@@ -73,24 +83,63 @@ def extract_all_prices(text: str) -> list[str]:
     return out
 
 
+def _pack_ratio_pair(
+    a: str, b: str
+) -> tuple[str, str] | None:
+    """Se maior ≈ N×menor (N=2..48), retorna (varejo=menor, atacado=maior)."""
+    lo, hi = sorted([a, b], key=_price_to_float)
+    lv, hv = _price_to_float(lo), _price_to_float(hi)
+    if lv <= 0:
+        return None
+    ratio = hv / lv
+    n = int(round(ratio))
+    if 2 <= n <= 48 and abs(ratio - n) <= 0.06:
+        return lo, hi
+    return None
+
+
 def assign_varejo_atacado(prices: list[str]) -> tuple[str | None, str | None]:
-    """Dois preços: maior=varejo, menor=atacado. Um preço: só atacado (Mateus L)."""
+    """Mateus: emb. pack (maior) = atacado, unitário (menor) = varejo."""
     if not prices:
         return None, None
     if len(prices) == 1:
-        # Etiqueta Mateus: dígito único lido costuma ser ATACADO (coluna esquerda).
-        return None, prices[0]
+        # Um preço só: costuma ser unitário (varejo) em tags simples.
+        only = prices[0]
+        if _price_to_float(only) >= 80.0:
+            return None, only
+        return only, None
 
-    def to_float(p: str) -> float:
-        return float(p.replace(".", "").replace(",", "."))
+    uniq = list(dict.fromkeys(prices))
+    if len(uniq) >= 2:
+        pack = _pack_ratio_pair(uniq[0], uniq[1])
+        if pack is None and len(uniq) > 2:
+            # Try extreme pair
+            ordered = sorted(uniq, key=_price_to_float)
+            pack = _pack_ratio_pair(ordered[0], ordered[-1])
+        if pack is not None:
+            return pack[0], pack[1]
 
-    ordered = sorted(prices, key=to_float, reverse=True)
+    ordered = sorted(uniq, key=_price_to_float)
     varejo = ordered[0]
-    atacado = ordered[1]
-    if to_float(varejo) == to_float(atacado):
+    atacado = ordered[-1]
+    if _price_to_float(varejo) == _price_to_float(atacado):
         return None, varejo
     return varejo, atacado
 
+
+def reconcile_spatial_prices(
+    varejo: str | None, atacado: str | None
+) -> tuple[str | None, str | None]:
+    """Corrige L/R invertido quando emb. pack caiu em varejo."""
+    if not varejo or not atacado:
+        return varejo, atacado
+    pack = _pack_ratio_pair(varejo, atacado)
+    if pack is not None:
+        return pack[0], pack[1]
+    # Se "varejo" >> "atacado" sem ratio de pack, ainda assim inverte.
+    if _price_to_float(varejo) > _price_to_float(atacado) * 1.5:
+        return atacado, varejo
+    return varejo, atacado
 
 _PRODUCT_NOUNS = (
     "ERVILHA",
@@ -191,21 +240,34 @@ def clean_product_name(text: str, *, brand_hint: str | None = None) -> str:
         else:
             brand_tok = brand
 
-        before = upper[max(0, idx - 24) : idx].strip()
+        before = upper[max(0, idx - 32) : idx].strip()
         after = upper[idx + len(brand_tok) : idx + len(brand_tok) + 16]
+        before_toks = before.split()
         noun = ""
+        noun_i = -1
         for n in _PRODUCT_NOUNS:
-            if n in before.split() or before.endswith(n):
+            if n in before_toks:
+                noun = n
+                noun_i = before_toks.index(n)
+                break
+            if before.endswith(n):
                 noun = n
                 break
         weight_m = WEIGHT_RE.search(after) or WEIGHT_RE.search(upper[idx : idx + 40])
-        parts = [p for p in (noun, brand) if p]
+        if noun and noun_i >= 0:
+            # Keep modifiers between noun and brand (MILHO VERDE PREDILECTA).
+            mid = before_toks[noun_i:]
+            parts = [*mid, brand]
+        else:
+            parts = [p for p in (noun, brand) if p]
         if weight_m:
             parts.append(f"{weight_m.group(1)}G")
         phrase = " ".join(parts)
         if not phrase:
             continue
         score = 80 + (30 if noun else 0) + (15 if weight_m else 0)
+        if noun and len(parts) >= 3:
+            score += 10
         scored.append((score, phrase))
 
     # Shelf-label style line: ERVILHA PREDILECTA SH 170G
@@ -251,11 +313,16 @@ def clean_product_name(text: str, *, brand_hint: str | None = None) -> str:
 
     if scored:
         scored.sort(key=lambda x: x[0], reverse=True)
-        best = scored[0][1]
-        best = re.sub(r"\b1700\b", "170G", best)
-        best = re.sub(r"\s+R\$?\s*$", "", best).strip(" -/")
-        best = _strip_noise_tokens(best)
-        return best
+        for _score, cand in scored:
+            best = re.sub(r"\b1700\b", "170G", cand)
+            best = re.sub(r"\s+R\$?\s*$", "", best).strip(" -/")
+            best = _strip_noise_tokens(best)
+            folded = _fold_upper(best)
+            has_brand = any(b in folded for b in brands)
+            has_noun = any(n in folded for n in _PRODUCT_NOUNS)
+            if best and (has_brand or has_noun):
+                return best
+        # Nenhum candidato com marca/noun — não devolver lixo tipo "PARR PARA".
 
     cleaned = _strip_noise_tokens(
         re.sub(r"[^\wÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\s,.\-/%]", " ", raw)

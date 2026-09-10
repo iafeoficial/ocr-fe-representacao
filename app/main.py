@@ -17,6 +17,7 @@ from .ocr import (
     clean_product_name,
     extract_all_prices,
     pick_unit_price,
+    reconcile_spatial_prices,
     run_ocr_best,
 )
 from .preprocess import prepare_tag_and_full, split_tag_price_halves, to_price_ocr_gray
@@ -24,8 +25,8 @@ from .preprocess import prepare_tag_and_full, split_tag_price_halves, to_price_o
 logger = logging.getLogger("pesquisa_ocr")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Pesquisa OCR", version="1.2.1")
-OCR_BUILD = "1.2.1-white-trim"
+app = FastAPI(title="Pesquisa OCR", version="1.2.2")
+OCR_BUILD = "1.2.2-shelf-trim"
 
 _settings = get_settings()
 app.add_middleware(
@@ -126,7 +127,8 @@ async def ocr_pesquisa(
                 psms=(7, 6, 11),
                 whitelist="0123456789R$rs., ",
             )
-            spatial_atacado = pick_unit_price(left_txt, prefer="min")
+            # Esquerda: EMB pack (maior). Direita: unitário varejo.
+            spatial_atacado = pick_unit_price(left_txt, prefer="max")
             spatial_varejo = pick_unit_price(right_txt, prefer="first")
 
         source_for_name = tag_text if len(tag_text) >= 8 else full_text
@@ -143,6 +145,9 @@ async def ocr_pesquisa(
         if spatial_atacado or spatial_varejo:
             preco_atacado = spatial_atacado
             preco_varejo = spatial_varejo
+            preco_varejo, preco_atacado = reconcile_spatial_prices(
+                preco_varejo, preco_atacado
+            )
             if preco_varejo and preco_atacado and preco_varejo == preco_atacado:
                 preco_varejo = None
         else:
