@@ -159,6 +159,7 @@ def clean_product_name(text: str) -> str:
         scored.sort(key=lambda x: x[0], reverse=True)
         best = scored[0][1]
         best = re.sub(r"\b1700\b", "170G", best)
+        best = re.sub(r"\s+R\$?\s*$", "", best).strip(" -/")
         return best
 
     cleaned = re.sub(r"[^\wÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\s,.\-/%]", " ", raw)
