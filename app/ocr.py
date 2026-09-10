@@ -261,4 +261,10 @@ def clean_product_name(text: str, *, brand_hint: str | None = None) -> str:
         re.sub(r"[^\wÁÉÍÓÚÂÊÔÃÕÇáéíóúâêôãõç\s,.\-/%]", " ", raw)
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    # Sem marca/noun conhecido: lixo OCR (ex. "IEEE HILL") — vazio para fallback.
+    folded = _fold_upper(cleaned)
+    has_brand = any(b in folded for b in brands)
+    has_noun = any(n in folded for n in _PRODUCT_NOUNS)
+    if cleaned and not has_brand and not has_noun:
+        return ""
     return cleaned[:80]

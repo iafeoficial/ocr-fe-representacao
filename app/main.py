@@ -24,7 +24,8 @@ from .preprocess import prepare_tag_and_full, split_tag_price_halves, to_price_o
 logger = logging.getLogger("pesquisa_ocr")
 logging.basicConfig(level=logging.INFO)
 
-app = FastAPI(title="Pesquisa OCR", version="1.2.0")
+app = FastAPI(title="Pesquisa OCR", version="1.2.1")
+OCR_BUILD = "1.2.1-white-trim"
 
 _settings = get_settings()
 app.add_middleware(
@@ -61,7 +62,7 @@ def _agent_log(hypothesis_id: str, message: str, data: dict[str, Any]) -> None:
 
 @app.get("/health")
 async def health() -> dict[str, str]:
-    return {"status": "ok"}
+    return {"status": "ok", "version": app.version, "build": OCR_BUILD}
 
 
 @app.post("/ocr/pesquisa", dependencies=[Depends(require_ocr_secret)])
@@ -150,11 +151,13 @@ async def ocr_pesquisa(
         preco = preco_varejo or preco_atacado
 
         _agent_log(
-            "A-B-F-G",
+            "H2-H3-H6",
             "ocr_pesquisa result",
             {
+                "build": OCR_BUILD,
                 "tagKind": tag_kind,
                 "usedTag": tag_gray is not None,
+                "tagShape": list(tag_bgr.shape[:2]) if tag_bgr is not None else None,
                 "tagTextSample": tag_text[:160],
                 "fullTextSample": full_text[:120],
                 "priceTextSample": price_text[:120],

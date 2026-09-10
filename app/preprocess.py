@@ -68,6 +68,43 @@ def find_yellow_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
     return _crop_padded(bgr, x, y, bw, bh)
 
 
+def _trim_white_paper_vs_blue_rail(
+    bgr: np.ndarray, x: int, y: int, bw: int, bh: int
+) -> tuple[int, int, int, int]:
+    """Aperta bbox horizontal: papel branco vs trilho azul (quebra chrome full-bleed)."""
+    h, w = bgr.shape[:2]
+    x0, y0 = max(0, x), max(0, y)
+    x1, y1 = min(w, x + bw), min(h, y + bh)
+    if x1 - x0 < 40 or y1 - y0 < 24:
+        return x, y, bw, bh
+    sub = bgr[y0:y1, x0:x1]
+    hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, (0, 0, 155), (180, 55, 255))
+    blue = cv2.inRange(hsv, (95, 70, 40), (130, 255, 255))
+    col_w = white.mean(axis=0)
+    col_b = blue.mean(axis=0)
+    # Colunas com papel branco dominante e pouco azul.
+    dom = (col_w > 70) & (col_b < 50)
+    best: tuple[int, int] | None = None
+    i = 0
+    sw = sub.shape[1]
+    while i < sw:
+        if not dom[i]:
+            i += 1
+            continue
+        j = i
+        while j < sw and dom[j]:
+            j += 1
+        if best is None or (j - i) > (best[1] - best[0]):
+            best = (i, j)
+        i = j
+    if best is None or (best[1] - best[0]) < max(80, int(bw * 0.25)):
+        return x, y, bw, bh
+    nx0 = x0 + best[0]
+    nx1 = x0 + best[1]
+    return nx0, y0, nx1 - nx0, y1 - y0
+
+
 def find_white_shelf_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
     """Recorta etiqueta branca Mateus (ATACADO|VAREJO) na borda da gôndola."""
     if bgr is None or bgr.size == 0:
@@ -86,27 +123,47 @@ def find_white_shelf_tag_bgr(bgr: np.ndarray) -> np.ndarray | None:
         cv2.getStructuringElement(cv2.MORPH_RECT, (15, 9)),
         iterations=2,
     )
+    # Break bridges to white UI chrome / letterbox so tag is not full-bleed.
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    mask = cv2.erode(mask, kernel, iterations=2)
+    mask = cv2.dilate(mask, kernel, iterations=2)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not cnts:
         return None
     scored: list[tuple[float, int, int, int, int]] = []
     for cnt in cnts:
         area = float(cv2.contourArea(cnt))
-        if area < img_area * 0.012 or area > img_area * 0.35:
+        if area < img_area * 0.008 or area > img_area * 0.28:
             continue
         x, y, bw, bh = cv2.boundingRect(cnt)
+        abs_x, abs_y = x, y0_search + y
         if bw < 80 or bh < 36:
             continue
         aspect = bw / max(bh, 1)
-        if aspect < 1.6 or aspect > 7.5:
+        # Mateus labels ~1.4–4; reject near full-frame chrome blobs.
+        if aspect < 1.35 or aspect > 6.5:
             continue
-        # Wider + mid-lower = typical Mateus shelf label.
-        score = area * (1.0 + aspect / 4.0) * (1.0 + (y0_search + y) / h)
-        scored.append((score, x, y0_search + y, bw, bh))
+        width_frac = bw / max(w, 1)
+        touches_both = abs_x <= 4 and (abs_x + bw) >= (w - 4)
+        if touches_both or width_frac > 0.88:
+            # Still try: trim blue rails then re-check.
+            tx, ty, tw, th = _trim_white_paper_vs_blue_rail(bgr, abs_x, abs_y, bw, bh)
+            if tw / max(w, 1) > 0.88 or (tx <= 4 and tx + tw >= w - 4):
+                continue
+            abs_x, abs_y, bw, bh = tx, ty, tw, th
+            aspect = bw / max(bh, 1)
+            area = float(bw * bh)
+            if aspect < 1.35 or bw < 80:
+                continue
+        # Prefer inset shelf labels over edge-to-edge chrome.
+        inset = 1.35 if (abs_x > 8 and abs_x + bw < w - 8) else 0.55
+        score = area * (1.0 + aspect / 4.0) * (1.0 + abs_y / h) * inset
+        scored.append((score, abs_x, abs_y, bw, bh))
     if not scored:
         return None
     scored.sort(key=lambda t: t[0], reverse=True)
     _, x, y, bw, bh = scored[0]
+    x, y, bw, bh = _trim_white_paper_vs_blue_rail(bgr, x, y, bw, bh)
     return _crop_padded(bgr, x, y, bw, bh, pad_frac=0.04)
 
 
